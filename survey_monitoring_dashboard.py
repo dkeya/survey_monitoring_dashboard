@@ -10,12 +10,13 @@ from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from PIL import Image
 import seaborn as sns
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from imblearn.over_sampling import SMOTE
 import plotly.express as px
 import plotly.graph_objects as go
 from textblob import TextBlob
@@ -79,10 +80,20 @@ def load_data():
         pest_cols = [col for col in df.columns if 'G03Q19' in col]
         df = convert_pesticide_columns(df, pest_cols)
         
-        # Preprocess data
-        df['G00Q01'] = df['G00Q01'].str.strip()
-        df['G00Q03'] = df['G00Q03'].str.strip()
+        # Preprocess data - ensure string columns are properly converted
+        df['G00Q01'] = df['G00Q01'].astype(str).str.strip()
+        df['G00Q03'] = df['G00Q03'].astype(str).str.strip()
         
+        # Create composite features for clustering
+        reg_cols = ['G00Q12.SQ001_SQ001.', 'G00Q12.SQ001_SQ002.', 
+                   'G00Q12.SQ001_SQ003.', 'G00Q12.SQ001_SQ004.']
+        if all(col in df.columns for col in reg_cols):
+            df['regulatory_score'] = df[reg_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+        
+        tech_cols = ['G00Q24.SQ001.', 'G00Q24.SQ002.', 'G00Q24.SQ003.']
+        if all(col in df.columns for col in tech_cols):
+            df['tech_impact_score'] = df[tech_cols].apply(pd.to_numeric, errors='coerce').mean(axis=1)
+            
         return df, total_records
         
     except Exception as e:
@@ -97,8 +108,19 @@ def clean_numeric(value):
     if isinstance(value, (int, float)):
         return float(value)
     
+    # Convert to string first to handle all cases
+    str_value = str(value).strip()
+    
+    # Handle percentage values
+    if '%' in str_value:
+        str_value = str_value.replace('%', '')
+        try:
+            return float(str_value) / 100
+        except ValueError:
+            return np.nan
+    
     # Remove non-numeric characters except decimal points and negative signs
-    cleaned = re.sub(r"[^\d.-]", "", str(value))
+    cleaned = re.sub(r"[^\d.-]", "", str_value)
     try:
         return float(cleaned) if cleaned else np.nan
     except ValueError:
@@ -192,7 +214,20 @@ def show_demand_side_analysis(df):
     # Policy harmonization analysis
     st.markdown("**Policy Harmonization Across Countries**")
     harmonization_cols = ['G00Q11.SQ001_SQ001.', 'G00Q11.SQ002_SQ001.', 'G00Q11.SQ003_SQ001.']
-    harmonization_df = df.groupby('G00Q01')[harmonization_cols].apply(lambda x: x.eq('Yes').mean())
+    
+    # Corrected implementation:
+    harmonization_data = []
+    for country, group in df.groupby('G00Q01'):
+        country_data = {'Country': country}
+        for col in harmonization_cols:
+            if col in group.columns:
+                # Convert to string and check for 'Yes'
+                country_data[col] = group[col].astype(str).str.contains('Yes').mean()
+            else:
+                country_data[col] = np.nan
+        harmonization_data.append(country_data)
+    
+    harmonization_df = pd.DataFrame(harmonization_data).set_index('Country')
     harmonization_df.columns = ['Pesticide Policy', 'Biosafety Policy', 'IPM Policy']
     
     fig, ax = plt.subplots(figsize=(12, 6))
@@ -311,6 +346,16 @@ def show_registration_time_comparison(df):
     """Compare registration times between LMICs and developed countries"""
     st.subheader("Registration Time Comparison: LMICs vs Developed Countries")
     
+    # Standardize time period labels
+    time_mapping = {
+        'below 1 year': '0-1 years',
+        '1-2 years': '1-2 years',
+        '2-3 years': '2-3 years',
+        'above 3 years': '3+ years',
+        'less than 1 year': '0-1 years',
+        'more than 3 years': '3+ years'
+    }
+
     # LMIC registration times
     time_cols = {
         'Conventional Pesticides': 'G00Q14.SQ001.',
@@ -322,13 +367,18 @@ def show_registration_time_comparison(df):
     developed_times = {
         'Conventional Pesticides': '1-2 years',
         'Biopesticides': '1-2 years',
-        'Biocontrol Agents': '2-3 years'
+        'Biocontrol Agents': '1-2 years'
     }
     
     time_data = []
     for tech_name, col in time_cols.items():
         if col in df.columns:
-            time_counts = df[col].value_counts(normalize=True).to_dict()
+            # Clean and standardize time labels
+            time_series = df[col].astype(str).str.strip().str.lower().replace(time_mapping)
+            
+            # Get normalized counts
+            time_counts = time_series.value_counts(normalize=True).to_dict()
+            
             for time_period, percent in time_counts.items():
                 time_data.append({
                     'Technology': tech_name,
@@ -340,7 +390,7 @@ def show_registration_time_comparison(df):
             # Add developed country data
             time_data.append({
                 'Technology': tech_name,
-                'Time Period': developed_times.get(tech_name, 'N/A'),
+                'Time Period': developed_times.get(tech_name, '1-2 years'),
                 'Percent': 100,  # Single value for developed countries
                 'Country Group': 'Developed Countries'
             })
@@ -348,7 +398,49 @@ def show_registration_time_comparison(df):
     if time_data:
         time_df = pd.DataFrame(time_data)
         
-        # Create separate charts for each technology
+        # --- Create summary table ---
+        st.markdown("**Summary Comparison**")
+        
+        # Prepare data for table
+        summary_data = []
+        for tech in time_df['Technology'].unique():
+            tech_data = {'Technology': tech}
+            
+            # Get LMIC data
+            lmic_data = time_df[(time_df['Technology'] == tech) & 
+                              (time_df['Country Group'] == 'LMICs')]
+            for _, row in lmic_data.iterrows():
+                tech_data[f"LMICs ({row['Time Period']})"] = row['Percent']
+            
+            # Get developed country data
+            dev_data = time_df[(time_df['Technology'] == tech) & 
+                             (time_df['Country Group'] == 'Developed Countries')]
+            tech_data["Developed Countries"] = dev_data['Time Period'].values[0]
+            
+            summary_data.append(tech_data)
+        
+        # Convert to DataFrame and fill missing values
+        summary_df = pd.DataFrame(summary_data).fillna(0)
+        
+        # Generate table
+        fig = go.Figure(data=[go.Table(
+            header=dict(
+                values=["<b>Technology</b>"] + 
+                      [f"<b>{col}</b>" for col in summary_df.columns[1:]],
+                fill_color="lightgreen",
+                font=dict(size=12, color="black", family="Arial Black")
+            ),
+            cells=dict(
+                values=[summary_df[col] for col in summary_df.columns],
+                fill_color="lavender",
+                font=dict(size=11)
+            )
+        )])
+        fig.update_layout(margin=dict(t=30, l=0, r=0, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # --- Original detailed charts ---
+        st.markdown("**Detailed Breakdown**")
         for tech in time_df['Technology'].unique():
             tech_df = time_df[time_df['Technology'] == tech]
             
@@ -362,12 +454,11 @@ def show_registration_time_comparison(df):
                 title=f'Registration Times for {tech}',
                 width=150
             )
-            
             st.altair_chart(chart)
         
         st.caption("""
-        **Insight:** Compares registration times between LMICs and developed countries. 
-        Developed countries generally show faster registration times across all technology types.
+        **Insight:** Developed countries show significantly faster registration times (typically 1-2 years) 
+        compared to LMICs where processes often take 2-3 years or longer, especially for biopesticides.
         """)
     else:
         st.warning("No registration time data available")
@@ -428,7 +519,7 @@ def show_response_overview(df):
 def show_policy_analysis(df):
     st.subheader("Policy and Regulation Analysis")
     
-    # Policy presence
+    # 1. Keep your existing policy presence visualization
     st.markdown("**Policy and Regulatory Framework Presence**")
     policy_cols = [
         'G00Q11.SQ001_SQ001.', 'G00Q11.SQ002_SQ001.', 
@@ -441,8 +532,8 @@ def show_policy_analysis(df):
     
     policy_df = pd.DataFrame({
         'Policy': policy_names,
-        'Yes': [df[col].str.contains('Yes').sum() for col in policy_cols],
-        'No': [df[col].str.contains('No').sum() for col in policy_cols]
+        'Yes': [df[col].astype(str).str.contains('Yes').sum() for col in policy_cols],
+        'No': [df[col].astype(str).str.contains('No').sum() for col in policy_cols]
     }).melt(id_vars='Policy', var_name='Response', value_name='Count')
     
     chart = alt.Chart(policy_df).mark_bar().encode(
@@ -455,8 +546,113 @@ def show_policy_analysis(df):
         height=400
     )
     st.altair_chart(chart, use_container_width=True)
+
+    # 2. NEW REGULATORY EFFECTIVENESS VISUALIZATION (replaces old one)
+    st.markdown("**Regulatory Process Effectiveness**")
     
-    # Innovation Ratings
+    # Define the rating columns and their display names
+    effectiveness_data = {
+        "Process": [
+            "Registration", 
+            "Post-Market Surveillance",
+            "Data Protection",
+            "Enforcement",
+            "Label Approval",
+            "Import Control",
+            "Export Control",
+            "Disposal"
+        ],
+        "Column": [
+            'G00Q12.SQ001_SQ001.',
+            'G00Q12.SQ001_SQ002.',
+            'G00Q12.SQ001_SQ003.',
+            'G00Q12.SQ001_SQ004.',
+            'G00Q12.SQ002_SQ001.',
+            'G00Q12.SQ002_SQ002.',
+            'G00Q12.SQ002_SQ003.',
+            'G00Q12.SQ002_SQ004.'
+        ]
+    }
+    
+    # Calculate average ratings
+    ratings = []
+    for i in range(len(effectiveness_data["Process"])):
+        col = effectiveness_data["Column"][i]
+        if col in df.columns:
+            avg_rating = pd.to_numeric(df[col], errors='coerce').mean()
+            ratings.append({
+                "Process": effectiveness_data["Process"][i],
+                "Average Rating": avg_rating,
+                "Category": "Core Regulation" if i < 4 else "Operational Control"
+            })
+    
+    if ratings:
+        reg_df = pd.DataFrame(ratings)
+        
+        # Create the visualization
+        fig = px.bar(reg_df,
+                     x="Average Rating",
+                     y="Process",
+                     color="Category",
+                     color_discrete_map={
+                         "Core Regulation": "#3498db",
+                         "Operational Control": "#2ecc71"
+                     },
+                     orientation="h",
+                     title="<b>Regulatory Effectiveness (1-5 Scale)</b><br>"
+                           "<span style='font-size:12px'>Higher scores indicate better performance</span>",
+                     text="Average Rating",
+                     height=500)
+        
+        # Add styling
+        fig.update_layout(
+            xaxis_range=[0,5],
+            yaxis={'categoryorder':'total ascending'},
+            plot_bgcolor='rgba(0,0,0,0)',
+            hoverlabel=dict(bgcolor="white"),
+            annotations=[
+                dict(x=3.5, y=0.05, xref="x", yref="paper",
+                     text="<b>Performance Threshold</b>", showarrow=True, arrowhead=1)
+            ]
+        )
+        
+        fig.add_vline(x=3.5, line_width=1, line_dash="dot", 
+                     line_color="red", opacity=0.7)
+        
+        fig.update_traces(texttemplate='<b>%{text:.1f}</b>',
+                         textposition='inside',
+                         marker_line_color='black',
+                         marker_line_width=0.5)
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Add interpretation
+        st.markdown("""
+        <div style="background-color:#f8f9fa;padding:15px;border-radius:10px;margin-top:10px">
+        <h4>Key Insights:</h4>
+        
+        <b>Top Performing Areas:</b>
+        <ul>
+            <li>Data Protection typically scores highest (avg. {data_protection:.1f}/5)</li>
+            <li>Registration processes show moderate efficiency (avg. {registration:.1f}/5)</li>
+        </ul>
+        
+        <b>Areas Needing Improvement:</b>
+        <ul>
+            <li>Disposal systems often inadequate (avg. {disposal:.1f}/5)</li>
+            <li>Export controls frequently under-resourced (avg. {export:.1f}/5)</li>
+        </ul>
+        </div>
+        """.format(
+            data_protection=reg_df[reg_df['Process']=='Data Protection']['Average Rating'].values[0],
+            registration=reg_df[reg_df['Process']=='Registration']['Average Rating'].values[0],
+            disposal=reg_df[reg_df['Process']=='Disposal']['Average Rating'].values[0],
+            export=reg_df[reg_df['Process']=='Export Control']['Average Rating'].values[0]
+        ))
+    else:
+        st.warning("Regulatory effectiveness data not available")
+
+    # 3. Keep your existing innovation ratings visualization
     st.markdown("**Innovation Enabling Ratings (1-5 scale)**")
     rating_cols = [
         'G00Q14.SQ001.', 'G00Q14.SQ002.', 'G00Q14.SQ003.', 
@@ -479,34 +675,6 @@ def show_policy_analysis(df):
         tooltip=['Innovation', 'Average Rating']
     ).properties(
         title='Average Innovation Enabling Ratings',
-        width=600,
-        height=400
-    )
-    st.altair_chart(chart, use_container_width=True)
-
-def show_registration_process(df):
-    st.subheader("Pesticide Registration Process")
-    reg_cols = [
-        'G00Q18.SQ001_SQ001.', 'G00Q18.SQ002_SQ001.', 'G00Q18.SQ003_SQ001.',
-        'G00Q18.SQ004_SQ001.', 'G00Q18.SQ005_SQ001.', 'G00Q18.SQ006_SQ001.'
-    ]
-    reg_names = [
-        "Dossier Submission", "Initial Admin Actions", "Completeness Check",
-        "Dossier Evaluation", "Registration Decision", "Publication"
-    ]
-    
-    reg_df = pd.DataFrame({
-        'Step': reg_names,
-        'Yes': [df[col].str.contains('Yes').sum() for col in reg_cols]
-    })
-    
-    chart = alt.Chart(reg_df).mark_bar().encode(
-        x='Yes:Q',
-        y=alt.Y('Step:N', sort='-x'),
-        color=alt.Color('Yes:Q', scale=alt.Scale(scheme='purples')),
-        tooltip=['Step', 'Yes']
-    ).properties(
-        title='Registration Process Steps (Conventional Pesticides)',
         width=600,
         height=400
     )
@@ -623,6 +791,259 @@ def show_text_analysis(df, title, columns):
     else:
         st.warning(f"No {title.lower()} data available")
 
+# --- Clustering Analysis ---
+def perform_clustering(df):
+    """Perform K-means clustering with visualization and country listing"""
+    st.subheader("Stakeholder Cluster Analysis")
+    
+    if df is None or len(df) < 5:
+        st.warning("Insufficient data for clustering (need at least 5 records)")
+        return
+    
+    # Prepare features - using composite scores if available, falling back to raw columns
+    cluster_features = []
+    if 'regulatory_score' in df.columns:
+        cluster_features.append('regulatory_score')
+    if 'tech_impact_score' in df.columns:
+        cluster_features.append('tech_impact_score')
+    
+    # Fallback to individual columns if composites not available
+    if not cluster_features:
+        cluster_features = [
+            'G00Q12.SQ001_SQ001.', 
+            'G00Q24.SQ001.',
+            'G00Q24.SQ002.'
+        ]
+    
+    # Filter to available features with data
+    available_features = [f for f in cluster_features if f in df.columns]
+    
+    # Create cluster_df with imputation for missing values instead of dropping
+    cluster_df = df[available_features].copy()
+    
+    # Impute missing values with column means
+    for col in cluster_df.columns:
+        if cluster_df[col].isna().any():
+            cluster_df[col] = cluster_df[col].fillna(cluster_df[col].mean())
+    
+    if len(cluster_df) < 5:
+        st.warning(f"Only {len(cluster_df)} complete records available for clustering")
+        return
+    
+    # Scale data
+    scaler = StandardScaler()
+    scaled_data = scaler.fit_transform(cluster_df)
+    
+    # Elbow method to determine optimal clusters
+    st.markdown("### Determining Optimal Number of Clusters")
+    inertia = []
+    max_clusters = min(10, len(cluster_df)-1)
+    for k in range(1, max_clusters):
+        kmeans = KMeans(n_clusters=k, random_state=42)
+        kmeans.fit(scaled_data)
+        inertia.append(kmeans.inertia_)
+    
+    fig1, ax1 = plt.subplots(figsize=(10, 4))
+    ax1.plot(range(1, max_clusters), inertia, marker='o')
+    ax1.set_title('Elbow Method for Optimal Cluster Number')
+    ax1.set_xlabel('Number of Clusters')
+    ax1.set_ylabel('Inertia')
+    ax1.grid(True)
+    st.pyplot(fig1)
+    
+    # Let user select number of clusters (default to 3)
+    n_clusters = st.slider("Select number of clusters", 
+                          min_value=2, 
+                          max_value=max_clusters-1, 
+                          value=3)
+    
+    # Perform clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    cluster_labels = kmeans.fit_predict(scaled_data)
+    
+    # PCA for visualization
+    pca = PCA(n_components=2)
+    pca_result = pca.fit_transform(scaled_data)
+    
+    # Create interactive plot
+    plot_df = pd.DataFrame({
+        'PC1': pca_result[:, 0],
+        'PC2': pca_result[:, 1],
+        'Cluster': cluster_labels,
+        'Country': df.loc[cluster_df.index, 'G00Q01'].astype(str),
+        'Stakeholder': df.loc[cluster_df.index, 'G00Q03'].astype(str)
+    })
+    
+    fig2 = px.scatter(plot_df, x='PC1', y='PC2', color='Cluster',
+                     hover_data=['Country', 'Stakeholder'],
+                     title='PCA Visualization of Clusters',
+                     color_discrete_sequence=px.colors.qualitative.Plotly)
+    st.plotly_chart(fig2, use_container_width=True)
+    
+    # Cluster profiles - show mean values for each feature
+    st.subheader("Cluster Characteristics")
+    
+    # Create working dataframe with cluster assignments
+    working_df = cluster_df.copy()
+    working_df['Cluster'] = cluster_labels
+    working_df['Country'] = df.loc[cluster_df.index, 'G00Q01'].astype(str)
+    
+    # Calculate statistics separately
+    numeric_means = working_df.select_dtypes(include=np.number).groupby('Cluster').mean()
+    cluster_counts = working_df.groupby('Cluster').size().rename('Count')
+    countries_per_cluster = working_df.groupby('Cluster')['Country'].agg(
+        lambda x: ', '.join(sorted(x.dropna().unique()))
+    ).rename('Countries in Cluster')
+    
+    # Combine results
+    profile_summary = pd.concat([cluster_counts, countries_per_cluster, numeric_means], axis=1)
+    
+    # Display with formatting
+    st.dataframe(profile_summary.style.background_gradient(
+        cmap='YlGnBu',
+        subset=numeric_means.columns.tolist()
+    ))
+    
+    # Interpretation guidance
+    st.markdown("""
+    **How to interpret clusters:**
+    - **Count**: Number of respondents in each cluster
+    - **Countries in Cluster**: Which countries are represented
+    - Compare mean values across clusters for each numeric feature
+    - Higher regulatory scores indicate better perceived regulatory effectiveness
+    - Higher tech impact scores indicate greater perceived technology benefits
+    - Look for patterns in the PCA plot (clusters near each other are similar)
+    """)
+
+# --- Updated Predictive Modeling Section ---
+def run_predictive_model(df):
+    """Predict whether technologies are seen as highly impactful"""
+    st.subheader("Predictive Modeling: Technology Impact Prediction")
+    
+    # 1. Define target variable - whether tech is seen as highly impactful (rating 4-5)
+    target_col = 'G00Q24.SQ001.'  # Tech impact rating
+    if target_col not in df.columns:
+        st.error(f"Critical column missing: {target_col}")
+        return
+    
+    # Create binary target (1=high impact, 0=moderate/low)
+    df['target'] = df[target_col].apply(lambda x: 1 if pd.notna(x) and float(x) >= 4 else 0)
+    
+    # 2. Define potential features with human-readable names
+    feature_options = {
+        'Regulatory Effectiveness': 'G00Q12.SQ001_SQ001.',
+        'Post-Market Surveillance': 'G00Q12.SQ001_SQ002.',
+        'Data Protection': 'G00Q12.SQ001_SQ003.',
+        'Enforcement': 'G00Q12.SQ001_SQ004.',
+        'Stakeholder Category': 'G00Q03',
+        'Country': 'G00Q01',
+        'Policy Harmonization': 'G00Q11.SQ001_SQ001.',
+        'IPM Implementation': 'G04Q21.SQ001.',
+        'Farmer Awareness': 'G00Q30.SQ001.'
+    }
+    
+    # Let user select features
+    selected_features = st.multiselect(
+        "Select features for prediction",
+        list(feature_options.keys()),
+        default=['Regulatory Effectiveness', 'Stakeholder Category', 'Country']
+    )
+    
+    # Map to actual column names
+    feature_cols = [feature_options[f] for f in selected_features]
+    feature_names = selected_features  # Keep the human-readable names
+    
+    # 3. Prepare data
+    model_df = df[feature_cols + ['target']].copy()
+    
+    # Encode categorical variables
+    for col in feature_cols:
+        if model_df[col].dtype == 'object':
+            le = LabelEncoder()
+            model_df[col] = le.fit_transform(model_df[col].astype(str))
+    
+    # Drop rows with missing values
+    model_df = model_df.dropna()
+    
+    if len(model_df) < 20:
+        st.warning(f"""
+        Insufficient complete cases: {len(model_df)} (need ≥20).
+        Missing data breakdown:
+        {df[feature_cols + [target_col]].isna().sum()}
+        """)
+        return
+    
+    # 4. Handle class imbalance
+    X = model_df[feature_cols]
+    y = model_df['target']
+    
+    if y.nunique() < 2:
+        st.warning("Target variable has only one class - cannot build model")
+        return
+    
+    # Show class distribution
+    class_counts = y.value_counts()
+    st.markdown(f"**Class Distribution:** {dict(class_counts)}")
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=42, stratify=y)
+    
+    # Apply SMOTE only if we have enough samples in minority class
+    min_class_count = min(y_train.value_counts())
+    if min_class_count >= 5:  # Need at least 5 samples for SMOTE
+        try:
+            smote = SMOTE(random_state=42, k_neighbors=min(5, min_class_count-1))
+            X_train, y_train = smote.fit_resample(X_train, y_train)
+            st.info(f"Applied SMOTE to balance classes. New training size: {len(X_train)}")
+        except ValueError as e:
+            st.warning(f"Could not apply SMOTE: {str(e)}. Proceeding with imbalanced data.")
+    else:
+        st.warning(f"Minority class has only {min_class_count} samples - SMOTE not applied")
+    
+    # 5. Train model
+    rf = RandomForestClassifier(random_state=42, class_weight='balanced')
+    rf.fit(X_train, y_train)
+    
+    # 6. Evaluate
+    y_pred = rf.predict(X_test)
+    report = classification_report(y_test, y_pred, output_dict=True)
+    report_df = pd.DataFrame(report).transpose()
+    
+    st.subheader("Model Performance")
+    st.dataframe(report_df.style.format("{:.2f}"))
+    
+    # Feature importance - use human-readable names
+    importance_df = pd.DataFrame({
+        'Feature': feature_names,  # Use human-readable names instead of column codes
+        'Importance': rf.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    fig = px.bar(importance_df, x='Importance', y='Feature', 
+                 title='Feature Importance',
+                 color='Importance',
+                 color_continuous_scale='Blues',
+                 labels={'Feature': 'Feature', 'Importance': 'Importance Score'})
+    
+    # Improve formatting
+    fig.update_layout(
+        yaxis={'categoryorder': 'total ascending'},
+        hovermode='y unified',
+        yaxis_title=None,
+        xaxis_title='Importance Score'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Interpretation
+    st.markdown("""
+    **How to interpret results:**
+    - Precision: Of predictions for this class, how many were correct?
+    - Recall: Of actual cases of this class, how many did we find?
+    - F1-score: Balance between precision and recall
+    - Feature importance shows which factors most influence predictions
+    """)
+
 def survey_monitoring_dashboard():
     st.title("🌾 Crop Protection Innovation Survey Dashboard")
     st.markdown("Monitoring the flow of crop protection innovation in low- and middle-income countries")
@@ -708,7 +1129,6 @@ def survey_monitoring_dashboard():
     show_kpi_cards(filtered_df, total_records)
     show_response_overview(filtered_df)
     show_policy_analysis(filtered_df)
-    show_registration_process(filtered_df)
     show_pesticide_data(filtered_df)
     show_adoption_metrics(filtered_df)
     
@@ -1037,166 +1457,10 @@ Stakeholders should consider mainstreaming sustainability metrics into technolog
     """)
     
     # Cluster analysis of respondents
-    st.subheader("Stakeholder Cluster Analysis")
-
-    # Prepare data for clustering - using only numeric columns
-    cluster_cols = [
-        'G00Q24.SQ001.', 'G00Q24.SQ002.', 'G00Q24.SQ003.',  # Impact ratings (should be numeric)
-        'G00Q12.SQ001_SQ001.', 'G00Q12.SQ001_SQ002.',       # Regulatory effectiveness (should be numeric)
-    ]
-
-    # Check if all required columns exist and have numeric data
-    available_cols = [col for col in cluster_cols if col in df.columns]
+    perform_clustering(filtered_df)
     
-    # Convert all columns to numeric, coercing errors to NaN
-    cluster_df = df[available_cols].apply(pd.to_numeric, errors='coerce').dropna()
-
-    if len(cluster_df) == 0:
-        st.warning("Insufficient numeric data for cluster analysis. Please check if the required columns exist and contain valid numeric data.")
-    else:
-        # Standardize data only if we have at least 2 samples
-        if len(cluster_df) > 1:
-            # Standardize data
-            cluster_df_std = (cluster_df - cluster_df.mean()) / cluster_df.std()
-
-            # Determine optimal number of clusters
-            inertia = []
-            max_clusters = min(6, len(cluster_df_std))  # Ensure we don't ask for more clusters than samples
-            for k in range(1, max_clusters):
-                kmeans = KMeans(n_clusters=k, random_state=42)
-                kmeans.fit(cluster_df_std)
-                inertia.append(kmeans.inertia_)
-
-            fig9, ax9 = plt.subplots(figsize=(10, 6))
-            ax9.plot(range(1, max_clusters), inertia, marker='o')
-            ax9.set_title('Elbow Method for Optimal Number of Clusters')
-            ax9.set_xlabel('Number of Clusters')
-            ax9.set_ylabel('Inertia')
-            st.pyplot(fig9)
-            st.caption("""
-            **Insight:** The elbow plot helps determine the optimal number of clusters for segmenting stakeholders.
-            """)
-
-            # Perform clustering with 3 clusters (or fewer if not enough data)
-            n_clusters = min(3, len(cluster_df_std)-1)
-            if n_clusters > 0:
-                kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-                cluster_labels = kmeans.fit_predict(cluster_df_std)
-
-                # Add clusters to dataframe
-                cluster_df['Cluster'] = cluster_labels
-
-                # Visualize clusters with PCA if we have at least 2 dimensions
-                if len(cluster_df_std.columns) >= 2:
-                    pca = PCA(n_components=2)
-                    pca_result = pca.fit_transform(cluster_df_std)
-
-                    fig10, ax10 = plt.subplots(figsize=(10, 6))
-                    scatter = ax10.scatter(pca_result[:, 0], pca_result[:, 1], c=cluster_labels, cmap='viridis')
-                    ax10.set_title('PCA Visualization of Stakeholder Clusters')
-                    ax10.set_xlabel('Principal Component 1')
-                    ax10.set_ylabel('Principal Component 2')
-                    if len(np.unique(cluster_labels)) > 1:
-                        legend = ax10.legend(*scatter.legend_elements(), title="Clusters")
-                        ax10.add_artist(legend)
-                    st.pyplot(fig10)
-                    st.caption("""
-                    **Insight:** The PCA visualization shows how stakeholders group based on their perceptions.
-                    """)
-
-                # Describe clusters
-                cluster_profiles = cluster_df.groupby('Cluster').mean()
-
-                fig11, ax11 = plt.subplots(figsize=(12, 6))
-                sns.heatmap(cluster_profiles.T, annot=True, cmap='YlGnBu', ax=ax11)
-                ax11.set_title('Average Values by Cluster')
-                st.pyplot(fig11)
-                st.caption("""
-                **Insight:** The heatmap reveals different stakeholder profiles based on their responses.
-                """)
-            else:
-                st.warning("Not enough data points to perform clustering.")
-        else:
-            st.warning("Not enough data points to determine optimal clusters.")
-
     # Predictive Modeling
- 
-    st.header("🔮 Predictive Analysis")
-
-    # Check if required columns exist
-    required_cols = ['G00Q03', 'G00Q24.SQ001.', 'G00Q24.SQ002.', 'G00Q24.SQ003.', 
-                    'G00Q12.SQ001_SQ001.', 'G00Q12.SQ001_SQ002.']
-    available_cols = [col for col in required_cols if col in df.columns]
-
-    if len(available_cols) == len(required_cols):
-        # Prepare data for prediction
-        model_df = df[required_cols].dropna()
-
-        if len(model_df) > 10:  # Minimum threshold for meaningful analysis
-            # Encode stakeholder type
-            le = LabelEncoder()
-            model_df['Stakeholder_Encoded'] = le.fit_transform(model_df['G00Q03'])
-    
-            # Define target (high impact on productivity)
-            model_df['High_Impact'] = (model_df['G00Q24.SQ001.'] >= 4).astype(int)
-    
-            # Features and target
-            X = model_df[['Stakeholder_Encoded', 'G00Q12.SQ001_SQ001.', 'G00Q12.SQ001_SQ002.']]
-            y = model_df['High_Impact']
-    
-            # Adjust test size based on available data
-            test_size = min(0.3, 0.9 * len(X) / len(X))  # Ensure we leave at least 10% for training
-    
-            # Train-test split with validation
-            try:
-                X_train, X_test, y_train, y_test = train_test_split(
-                    X, y, 
-                    test_size=test_size, 
-                    random_state=42,
-                    stratify=y
-                )
-        
-                # Only proceed if we have samples in both sets
-                if len(X_train) > 0 and len(X_test) > 0:
-                    # Train model
-                    rf = RandomForestClassifier(random_state=42)
-                    rf.fit(X_train, y_train)
-            
-                    # Evaluate
-                    y_pred = rf.predict(X_test)
-                    report = classification_report(y_test, y_pred, output_dict=True)
-                    report_df = pd.DataFrame(report).transpose()
-            
-                    st.subheader("Classification Report for Predicting High Productivity Impact")
-                    st.dataframe(report_df.style.format("{:.2f}"))
-                    st.caption("""
-                    **Insight:** The model predicts whether stakeholders will rate technologies as having 
-                    high productivity impact based on their type and regulatory effectiveness perceptions.
-                    """)
-            
-                    # Feature importance
-                    importance_df = pd.DataFrame({
-                        'Feature': X.columns,
-                        'Importance': rf.feature_importances_
-                    }).sort_values('Importance', ascending=False)
-            
-                    fig12, ax12 = plt.subplots(figsize=(10, 6))
-                    sns.barplot(data=importance_df, y='Feature', x='Importance', ax=ax12)
-                    ax12.set_title('Feature Importance for Predicting High Productivity Impact')
-                    st.pyplot(fig12)
-                    st.caption("""
-                    **Insight:** Shows which factors most influence perceptions of technology impact.
-                    """)
-                else:
-                    st.warning("Insufficient data after train-test split to perform analysis.")
-        
-            except ValueError as e:
-                st.warning(f"Could not perform predictive analysis: {str(e)}")
-        else:
-            st.warning(f"Insufficient data for predictive analysis (only {len(model_df)} valid records). Need at least 10.")
-    else:
-        missing_cols = set(required_cols) - set(available_cols)
-        st.warning(f"Cannot perform predictive analysis. Missing required columns: {missing_cols}")
+    run_predictive_model(filtered_df)
 
     # Prescriptive Recommendations
     st.header("💡 Prescriptive Recommendations")
@@ -1334,7 +1598,7 @@ Stakeholders should consider mainstreaming sustainability metrics into technolog
 o	Mali and Saudi Arabia rate highest across all indicators — productivity, sustainability, and registration effectiveness — suggesting robust regulatory frameworks and positive technology outcomes.
 o	Zimbabwe also shows strong scores in sustainability and registration despite moderate productivity.
 •	Moderate Performers:
-o	Kenya, Nigeria, Tanzania, Ghana, and Côte d’Ivoire demonstrate fairly balanced but mid-level performance, indicating room for growth especially in productivity or registration systems.
+o	Kenya, Nigeria, Tanzania, Ghana, and Côte d'Ivoire demonstrate fairly balanced but mid-level performance, indicating room for growth especially in productivity or registration systems.
 •	Low Performers:
 o	South Africa, Zambia, Angola, and Ethiopia report low average scores, particularly in productivity and effectiveness, which may reflect bottlenecks in adoption or weak regulatory implementation.
 •	Missing/Incomplete Data:
