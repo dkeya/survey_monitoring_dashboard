@@ -13,3 +13,8 @@ matplotlib
 seaborn
 scikit-learn
 textblob
+streamlit
+pandas
+numpy
+scikit-learn
+imbalanced-learn  # Required for SMOTE
